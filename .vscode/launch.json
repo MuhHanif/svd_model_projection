@@ -10,7 +10,7 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
-            "justMyCode": true,
+            "justMyCode": false,
             "python": "/home/zadmin/svd_model_projection/experiment_env/bin/python3.10"
         }
     ]
