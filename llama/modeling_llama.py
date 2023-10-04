@@ -30,14 +30,88 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
+from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings, ModelOutput
 from .configuration_llama import LlamaConfig
-
+from dataclasses import dataclass
 
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
 
+@dataclass
+class CausalLMOutputWithPast(ModelOutput):
+    """
+    Base class for causal language model (or autoregressive) outputs.
+
+    Args:
+        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+            Language modeling loss (for next-token prediction).
+        logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+        past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+            Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of shape
+            `(batch_size, num_heads, sequence_length, embed_size_per_head)`)
+
+            Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
+            `past_key_values` input) to speed up sequential decoding.
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
+
+            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
+        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            sequence_length)`.
+
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+    """
+
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    all_gemm_states: Optional[Tuple[torch.FloatTensor]] = None
+
+@dataclass
+class BaseModelOutputWithPast(ModelOutput):
+    """
+    Base class for model's outputs that may also contain a past key/values (to speed up sequential decoding).
+
+    Args:
+        last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
+            Sequence of hidden-states at the output of the last layer of the model.
+
+            If `past_key_values` is used only the last hidden-state of the sequences of shape `(batch_size, 1,
+            hidden_size)` is output.
+        past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+            Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of shape
+            `(batch_size, num_heads, sequence_length, embed_size_per_head)`) and optionally if
+            `config.is_encoder_decoder=True` 2 additional tensors of shape `(batch_size, num_heads,
+            encoder_sequence_length, embed_size_per_head)`.
+
+            Contains pre-computed hidden-states (key and values in the self-attention blocks and optionally if
+            `config.is_encoder_decoder=True` in the cross-attention blocks) that can be used (see `past_key_values`
+            input) to speed up sequential decoding.
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
+
+            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
+        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            sequence_length)`.
+
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+    """
+
+    last_hidden_state: torch.FloatTensor = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    all_gemm_states: Optional[Tuple[torch.FloatTensor]] = None
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
@@ -199,7 +273,15 @@ class LlamaMLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
+    def forward(self, x, output_gemm_activation: bool = False,):
+
+        if output_gemm_activation:
+            if self.config.pretraining_tp > 1:
+                raise "Cannot output gemm activation if tensor parallelism is enabled"
+            cached_gemm_states = {
+                "mlp_gate_up_input": x,
+            }
+
         if self.config.pretraining_tp > 1:
             slice = self.intermediate_size // self.config.pretraining_tp
             gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
@@ -217,9 +299,26 @@ class LlamaMLP(nn.Module):
             ]
             down_proj = sum(down_proj)
         else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+            if output_gemm_activation:
+                if self.config.pretraining_tp > 1:
+                    raise "Cannot output gemm activation if tensor parallelism is enabled"
+                
+                gate_proj = self.gate_proj(x)
+                up_proj = self.up_proj(x)
+                gated_up_proj = self.act_fn(gate_proj) * up_proj
+                down_proj = self.down_proj(gated_up_proj)
 
-        return down_proj
+                cached_gemm_states["gate_proj_output"] = gate_proj
+                cached_gemm_states["up_proj_output"] = up_proj
+                cached_gemm_states["down_proj_input"] = gated_up_proj
+                cached_gemm_states["down_proj_output"] = down_proj
+            else:
+                down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+        if not output_gemm_activation:
+            cached_gemm_states = None
+
+        return down_proj, cached_gemm_states
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -296,6 +395,7 @@ class LlamaAttention(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
+        output_gemm_activation: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
@@ -321,6 +421,27 @@ class LlamaAttention(nn.Module):
             query_states = self.q_proj(hidden_states)
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
+
+        if output_gemm_activation:
+            if self.config.pretraining_tp > 1:
+                raise "Cannot output gemm activation if tensor parallelism is enabled"
+
+            cached_gemm_states = {
+                "qkv_input": hidden_states,
+                "query_output" : None,
+                "key_output" : None,
+                "value_output" : None,
+                "out_input": None,
+                "out_output" : None,
+            }
+
+
+        if output_gemm_activation:
+            if self.config.pretraining_tp > 1:
+                raise "Cannot output gemm activation if tensor parallelism is enabled"
+            cached_gemm_states["query_output"] = query_states
+            cached_gemm_states["key_output"] = key_states
+            cached_gemm_states["value_output"] = value_states
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -362,6 +483,11 @@ class LlamaAttention(nn.Module):
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_states)
 
+        if output_gemm_activation:
+            if self.config.pretraining_tp > 1:
+                raise "Cannot output gemm activation if tensor parallelism is enabled"
+            cached_gemm_states["out_input"] = attn_output
+
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
@@ -378,10 +504,18 @@ class LlamaAttention(nn.Module):
         else:
             attn_output = self.o_proj(attn_output)
 
+        if output_gemm_activation:
+            if self.config.pretraining_tp > 1:
+                raise "Cannot output gemm activation if tensor parallelism is enabled"
+            cached_gemm_states["out_output"] = attn_output
+
         if not output_attentions:
             attn_weights = None
 
-        return attn_output, attn_weights, past_key_value
+        if not output_gemm_activation:
+            cached_gemm_states = None
+
+        return attn_output, attn_weights, past_key_value, cached_gemm_states
 
 
 class LlamaDecoderLayer(nn.Module):
@@ -400,6 +534,7 @@ class LlamaDecoderLayer(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
+        output_gemm_activation: Optional[bool] = False,
         use_cache: Optional[bool] = False,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -410,6 +545,8 @@ class LlamaDecoderLayer(nn.Module):
             output_attentions (`bool`, *optional*):
                 Whether or not to return the attentions tensors of all attention layers. See `attentions` under
                 returned tensors for more detail.
+            output_gemm_activation (`bool`, *optional*):
+                Whether or not to return the gemm input output tensors.
             use_cache (`bool`, *optional*):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
@@ -421,12 +558,13 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        hidden_states, self_attn_weights, present_key_value, cached_gemm_states_attn = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
+            output_gemm_activation=output_gemm_activation,
             use_cache=use_cache,
         )
         hidden_states = residual + hidden_states
@@ -434,7 +572,7 @@ class LlamaDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states, cached_gemm_states_mlp = self.mlp(hidden_states, output_gemm_activation=output_gemm_activation,)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -444,6 +582,10 @@ class LlamaDecoderLayer(nn.Module):
 
         if use_cache:
             outputs += (present_key_value,)
+
+        if  output_gemm_activation:
+            cached_gemm_states_mlp.update(cached_gemm_states_attn)
+            outputs += (cached_gemm_states_mlp,)
 
         return outputs
 
@@ -576,7 +718,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
+        # self.output_gemm_activation = True
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
@@ -622,8 +764,10 @@ class LlamaModel(LlamaPreTrainedModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        output_gemm_activation: Optional[bool] = True,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
+        # output_gemm_activation = self.output_gemm_activation
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -682,6 +826,7 @@ class LlamaModel(LlamaPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
+        all_gemm_states = () if output_gemm_activation else None
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -712,6 +857,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    output_gemm_activation=output_gemm_activation,
                 )
 
             hidden_states = layer_outputs[0]
@@ -722,6 +868,9 @@ class LlamaModel(LlamaPreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
+            if output_gemm_activation:
+                all_gemm_states += ({idx:layer_outputs[3 if output_attentions else 2]},) # TODO: stupid relative array size 
+
         hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
@@ -730,12 +879,13 @@ class LlamaModel(LlamaPreTrainedModel):
 
         next_cache = next_decoder_cache if use_cache else None
         if not return_dict:
-            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_gemm_states] if v is not None)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
+            all_gemm_states=all_gemm_states,
         )
 
 
@@ -782,6 +932,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        output_gemm_activation: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
@@ -827,6 +978,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            output_gemm_activation=output_gemm_activation,
         )
 
         hidden_states = outputs[0]
@@ -861,6 +1013,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            all_gemm_states=outputs.all_gemm_states,
+
         )
 
     def prepare_inputs_for_generation(
