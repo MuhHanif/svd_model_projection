@@ -1,6 +1,7 @@
 import torch
 from datasets import load_dataset
-from transformers import AutoTokenizer, LlamaForCausalLM
+from transformers import AutoTokenizer
+from llama import LlamaForCausalLM
 from typing import Any
 import gc
 from matplotlib import pyplot as plt
