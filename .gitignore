@@ -1,3 +1,4 @@
 *.png
 *.pyc
-/lobotomized-CodeLlama-13b-Instruct-hf
+/lobotomized-*
+*.msgpack

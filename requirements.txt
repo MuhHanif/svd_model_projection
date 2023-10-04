@@ -3,3 +3,7 @@ transformers
 accelerate 
 matplotlib
 msgpack
+pandas
+datasets
+zstandard
+sentencepiece

@@ -51,44 +51,10 @@ def graph_svd(sample:np.array, name:str) -> None:
     plt.savefig(f"{name}.png")
     plt.close()
 
-def radical_brain_surgery_projected(sample: torch.tensor, sigma_threshold: float) -> torch.tensor:
+def radical_brain_surgery(sample:torch.tensor, rank_slice:int) -> torch.tensor:
     sample = sample.to(dtype=torch.float32, device="cuda:0")
     U, sigma, Vh = torch.linalg.svd(sample)
 
-    def _sigma_threshold(sigma: torch.tensor, sigma_threshold: float) -> int:
-        # Initialize max_sigma_value with the value of the first element of S
-        max_sigma_value = sigma[0]
-
-        # Calculate min_sigma_value by dividing max_sigma_value by the target value
-        min_sigma_value = max_sigma_value / sigma_threshold
-
-        # Count the number of elements in S that are greater than min_sv
-        index = int(torch.sum(sigma > min_sigma_value).item())
-
-        # Ensure index is at least 1 and at mostne len(S) - 1
-        index = max(1, min(index, len(sigma) - 1))
-
-        return index
-
-    def _cum_sum_percentage(S, percentage_target):
-        # Convert S to a NumPy array
-        
-        # get cumulative sum of the array   
-        cumsum_S = torch.cumsum(S, dim=0)
-        
-        max_value = torch.max(cumsum_S)
-
-        target = max_value * percentage_target
-
-        # Calculate absolute difference from the target value to decide near zero point
-        absolute_div = torch.abs(cumsum_S - target)
-        
-        # grab the index of near zero value
-        index = torch.argmin(absolute_div)
-        
-        return index
-
-    rank_slice = _cum_sum_percentage(sigma, sigma_threshold)
 
     # slice the decomposed matrix based on rank to keep
     U = U[:, :rank_slice]
@@ -104,6 +70,18 @@ def radical_brain_surgery_projected(sample: torch.tensor, sigma_threshold: float
     torch.cuda.empty_cache()
     gc.collect()
     return new_tensor_cpu
+
+def compute_sigma(sample:torch.tensor) -> torch.tensor:
+    sample = sample.to(dtype=torch.float32, device="cuda:0")
+    sigma = torch.linalg.svdvals(sample)
+    
+    new_sigma = sigma.to(dtype=torch.float32, device="cpu")
+    
+    del sigma, sample
+    torch.cuda.empty_cache()
+    gc.collect()
+    return new_sigma
+
 
 def heatmap(low_rank_array:torch.tensor, full_rank_array:torch.tensor, name:str) -> None:
     cmap = mcolors.LinearSegmentedColormap.from_list(
@@ -170,6 +148,17 @@ def filter_list_by_patterns(input_list: List[str], patterns: List[str]) -> List[
     
     return filtered_list
 
+def convert_tensors_to_lists(input_dict):
+    if isinstance(input_dict, dict):
+        # Recursively process all the values in the dictionary
+        return {key: convert_tensors_to_lists(value) for key, value in input_dict.items()}
+    elif isinstance(input_dict, torch.Size):
+        return list(input_dict)  # Convert PyTorch tensor to list
+    else:
+        # If it's neither a dictionary nor a tensor, return it as is
+        return input_dict.tolist()
+
+
 # init model from pipeline (easier to do)
 model_dir = "/home/zadmin/llama_stuff/CodeLlama-13b-Instruct-hf"
 tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path=model_dir)
@@ -195,22 +184,29 @@ layer_shape = {}
 gemm_layer = []
 
 for leaf_name, leaf_params in model.state_dict().items():
-    layer_shape[leaf_name] = leaf_params.shape
+    layer_shape[leaf_name] = {"shape":leaf_params.shape}
     if len(leaf_params.shape) == 2:
         gemm_layer.append(leaf_name)
 
 # gemm layer that gonna be deranked
-gemm_layer_to_be_converted = filter_list_by_patterns(gemm_layer,[r"model.embed_tokens.weight", r"lm_head.weight"])
+# gemm_layer_to_be_converted = filter_list_by_patterns(gemm_layer,[r"model.embed_tokens.weight", r"lm_head.weight"])
 
 # derank state dict based on lut
-clone_model = model.state_dict()
-for layer in gemm_layer_to_be_converted:
-    print(f"converting {layer}")
-    clone_model[layer] = radical_brain_surgery_projected(
-        sample = model.state_dict()[layer],
-        sigma_threshold=0.6
-        ).to(dtype=torch.float16)# * 1/0.6
+# clone_model = model.state_dict()
+# for layer in gemm_layer_to_be_converted:
+#     print(f"converting {layer}")
+#     clone_model[layer] = radical_brain_surgery(
+#         sample = model.state_dict()[layer],
+#         rank_slice=1000
+#         ).to(dtype=torch.float16)
 
+
+# calculate sigma for each gemm layer
+for layer in gemm_layer:
+    print(f"calculating sigma {layer}")
+    layer_shape[layer]["sigma_array"] = compute_sigma(
+        sample = model.state_dict()[layer],
+        ).numpy()
 
 # check if the model has bias
 # is_bias_exist = [leaf_node if bool(re.search(r"bias", leaf_node)) else None for leaf_node in layer_name]
@@ -230,9 +226,17 @@ for layer in gemm_layer_to_be_converted:
 
 # sampled layer
 # sample = pipeline.model.state_dict()["model.layers.39.self_attn.q_proj.weight"].numpy()
-model.load_state_dict(clone_model)
-model.save_pretrained("lobotomized-CodeLlama-13b-Instruct-hf-60")
+# model.load_state_dict(clone_model)
+# model.save_pretrained("lobotomized-CodeLlama-13b-Instruct-hf-1000")
 # model = model.load_state_dict(clone_model)
 
+layer_shape_python = convert_tensors_to_lists(layer_shape)
 
-print() 
+# Serialize the ordered dictionary to MessagePack format
+packed_weight = msgpack.packb(layer_shape_python)
+
+# Store the packed data in a file (binary mode)
+with open('CodeLlama-13b-Instruct-hf-sigma.msgpack', 'wb') as file:
+    file.write(packed_weight)
+
+print()
