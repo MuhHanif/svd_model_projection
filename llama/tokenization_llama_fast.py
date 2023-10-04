@@ -18,9 +18,9 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 from tokenizers import processors
 
-from ...tokenization_utils_fast import PreTrainedTokenizerFast
-from ...utils import is_sentencepiece_available, logging
-from ...utils.versions import require_version
+from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
+from transformers.utils import is_sentencepiece_available, logging
+from transformers.utils.versions import require_version
 
 
 if TYPE_CHECKING:
