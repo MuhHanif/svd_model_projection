@@ -826,7 +826,7 @@ class LlamaModel(LlamaPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
-        all_gemm_states = () if output_gemm_activation else None
+        all_gemm_states = {} if output_gemm_activation else None
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -869,7 +869,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 all_self_attns += (layer_outputs[1],)
 
             if output_gemm_activation:
-                all_gemm_states += ({idx:layer_outputs[3 if output_attentions else 2]},) # TODO: stupid relative array size 
+                all_gemm_states[f"layer_{idx}"] = layer_outputs[3 if output_attentions else 2] # TODO: stupid relative array size 
 
         hidden_states = self.norm(hidden_states)
 
@@ -934,6 +934,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         output_gemm_activation: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        logits_rescale: Optional[float] = 1, 
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -988,7 +989,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             logits = torch.cat(logits, dim=-1)
         else:
             logits = self.lm_head(hidden_states)
-        logits = logits.float()
+        logits = logits.float() * logits_rescale
 
         loss = None
         if labels is not None:

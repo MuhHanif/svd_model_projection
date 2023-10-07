@@ -7,6 +7,7 @@ import gc
 from matplotlib import pyplot as plt
 import matplotlib.colors as mcolors
 import numpy as np
+import optree
 
 # type hints stuff
 LLM_models = Any
@@ -17,7 +18,7 @@ model = LlamaForCausalLM.from_pretrained(
     pretrained_model_name_or_path=model_dir,
     torch_dtype=torch.float16,
     device_map="sequential",
-    max_memory={0: "12GiB", 1: "24GiB"},
+    max_memory={0: "13GiB", 1: "24GiB"},
 )
 
 def graph_weight(sample:np.array, new_tensor:np.array, name:str=None) -> None:
@@ -137,21 +138,6 @@ class BrainProbe:
             intercept and store the activation
             """
 
-            def _tree_util(nested_list, fn):
-                if isinstance(nested_list, torch.Tensor):
-                    return fn(nested_list)
-                elif isinstance(nested_list, list):
-                    return [_tree_util(item, fn) for item in nested_list]
-                elif isinstance(nested_list, tuple):
-                    return tuple(_tree_util(item, fn) for item in nested_list)
-                elif isinstance(nested_list, dict):
-                    return {key: _tree_util(value, fn) for key, value in nested_list.items()}
-                else:
-                    return nested_list
-
-            def _accumulate(prior_tensor, tensor):
-                return prior_tensor + tensor * self.scale 
-
             def _move_tensor_to_x(tensor):
                 cpu_tensor = tensor.to(self.cache_tensor_location)
                 del tensor
@@ -160,8 +146,8 @@ class BrainProbe:
                 return cpu_tensor
                 
             self.activations[name] = {
-                "input_activation": _tree_util(input_tensor, _move_tensor_to_x),
-                "output_activation": _tree_util(output_tensor, _move_tensor_to_x),
+                "input_activation": optree.tree_map(_move_tensor_to_x, input_tensor),
+                "output_activation": optree.tree_map(_move_tensor_to_x, output_tensor),
             }
             del input_tensor, output_tensor
             torch.cuda.empty_cache()
@@ -180,11 +166,16 @@ class BrainProbe:
         pass
 
 
-token = get_calib_dataset(tokenizer=tokenizer, n_samples=1000, block_size=1024)
+token = get_calib_dataset(tokenizer=tokenizer, n_samples=100, block_size=4096)
 
 probe = BrainProbe(model=model)
 probe.attach_probe()
 
 with torch.no_grad():
-    outputs = model(torch.cat(token[:5]))
+
+    outputs = model(token[0])
+    cache = probe.activations
+    for x in range(1, len(token)):
+        outputs = model(token[x])
+        cache = optree.tree_map(lambda x, y: x + y, cache, probe.activation)
 print()

@@ -10,6 +10,49 @@ import matplotlib.colors as mcolors
 import numpy as np
 from transformers.activations import ACT2FN
 import optree
+import safetensors
+from safetensors.torch import save_file
+
+def dict_to_dot_notation(input_dict, parent_key='', separator='.'):
+    """
+    Convert a dictionary to dot notation.
+    
+    Args:
+        input_dict (dict): The input dictionary to be converted.
+        parent_key (str): The parent key for recursive calls (used internally).
+        separator (str): The separator to use between keys in dot notation.
+
+    Returns:
+        dict: A new dictionary with dot notation keys.
+    """
+    output_dict = {}
+    for key, value in input_dict.items():
+        new_key = f"{parent_key}{separator}{key}" if parent_key else key
+        if isinstance(value, dict):
+            output_dict.update(dict_to_dot_notation(value, new_key, separator))
+        else:
+            output_dict[new_key] = value
+    return output_dict
+
+def dot_notation_to_dict(input_dict, separator='.'):
+    """
+    Convert a dictionary in dot notation back to a nested dictionary.
+    
+    Args:
+        input_dict (dict): The input dictionary with dot notation keys.
+        separator (str): The separator used between keys in dot notation.
+
+    Returns:
+        dict: A new nested dictionary.
+    """
+    output_dict = {}
+    for key, value in input_dict.items():
+        keys = key.split(separator)
+        current_dict = output_dict
+        for k in keys[:-1]:
+            current_dict = current_dict.setdefault(k, {})
+        current_dict[keys[-1]] = value
+    return output_dict
 
 def get_calib_dataset(data="pileval", tokenizer=None, n_samples=512, block_size=4096):
     if data == "pileval":
@@ -62,6 +105,7 @@ def main():
     config = LlamaConfig.from_json_file("dummy_config.json")
     embbeding_model = LlamaEmbedding(config)
 
+    # load model
     tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path=model_dir)
     model = LlamaForCausalLM.from_pretrained(
         pretrained_model_name_or_path=model_dir,
@@ -70,10 +114,11 @@ def main():
         max_memory={0: "13GiB", 1: "24GiB"},
     )
 
-    
-    token = get_calib_dataset(tokenizer=tokenizer, n_samples=500, block_size=2048)
+    # get dataset
+    token = get_calib_dataset(tokenizer=tokenizer, n_samples=5000*4, block_size=2048)
 
     with torch.no_grad():
+        # compute and stash gemm activation
         outputs = model(token[0], output_gemm_activation=True)
         activation = optree.tree_map(lambda gpu_leaf: gpu_leaf.to(device="cpu"), outputs[2])
         gc.collect()
@@ -83,7 +128,13 @@ def main():
             activation = optree.tree_map(lambda cpu_leaf, gpu_leaf: cpu_leaf + gpu_leaf.to(device="cpu"), activation, outputs[2])
             gc.collect()
         
-        activation = optree.tree_map(lambda cpu_leaf: cpu_leaf / len(token), activation)
+        # absolute average activation magnitude
+        activation = optree.tree_map(lambda cpu_leaf: torch.abs(cpu_leaf / len(token)), activation)
+
+        # flatten the dict for saving it as safetensors
+        activation = dict_to_dot_notation(activation)
+        save_file(activation, "activation.safetensors")
+
     print()
 
 if __name__ == "__main__":
