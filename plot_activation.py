@@ -438,9 +438,32 @@ def modify_weights_with_1d_mask(model, mask:dict):
                 break # break the inner loop
 
 
+def reload_from_cpu(model, model_state_dict_cpu:dict):
+   
+    # Modify the weight parameter
+    for in_gpu_layer_name, in_gpu_tensor in model.named_parameters():
+        
+        for in_cpu_layer_name, in_cpu_tensor in model_state_dict_cpu.items():
 
-def main():
-    cached_activation = load_all_tensors("activation.safetensors")
+            if in_gpu_layer_name == in_cpu_layer_name:
+
+                in_gpu_tensor.data = in_cpu_tensor.to(device=in_gpu_tensor.data.device)
+                gc.collect()
+                break # break the inner loop
+
+def store_state_dict(model):
+
+    cpu_params = {}
+    # Modify the weight parameter
+    for in_gpu_layer_name, in_gpu_tensor in model.named_parameters():
+        cpu_params[in_gpu_layer_name] = in_gpu_tensor.to(device="cpu")
+    
+    return cpu_params
+
+
+def load_cached_activation(safetensors_path:str):
+
+    cached_activation = load_all_tensors(safetensors_path)
     # there's inf value so i flip it to neg inf
     cached_activation = optree.tree_map(
         lambda x: torch.nan_to_num(
@@ -461,23 +484,13 @@ def main():
         cached_activation[f"layer_{layer}.out_input"] = merge_heads(
             cached_activation[f"layer_{layer}.out_input"]
         )
+    return cached_activation
 
-    # weight mask by activation
-    mask = optree.tree_map(lambda x: create_activation_mask(x, percentage=0.95),cached_activation)
-    # collapse the channel dimension by summing it 
-    # to determine the activation contribution
-    # then rescale to 0 to 1 range
-    cached_activation_scaled = optree.tree_map(
-        lambda x: minmax_scale(x.view(2048, -1).to(dtype=torch.float32).sum(axis=0)),
-        cached_activation,
-    )
-    # sort the tensor descending so lower activation value can be culled / removed
-    cached_activation_sorted = optree.tree_map(
-        lambda x: x.sort(axis=0, descending=True).values, cached_activation_scaled
-    )
+def main():
+    cached_activation = load_cached_activation("activation.safetensors")
 
 
-
+    
 
     model_dir = "/home/zadmin/llama_stuff/CodeLlama-13b-Instruct-hf"
     tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path=model_dir)
@@ -490,6 +503,9 @@ def main():
         max_memory={0: "13GiB", 1: "24GiB"},
     )
 
+    cpu_params = store_state_dict(model)
+
+
     prompt = "[INST] hello, can you explain what dark matter is?[/INST]"
     inputs = tokenizer(prompt, return_tensors="pt")
 
@@ -497,35 +513,54 @@ def main():
     generate_ids = model.generate(inputs.input_ids, max_length=30)
     print(tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0])
 
-
-    weight_mask = create_mask(40, mask)
-    modify_weights(model, weight_mask)
+    # weight mask by activation
+    # collapse the channel dimension by summing it 
+    mask = optree.tree_map(lambda x: create_activation_mask(x, percentage=0.95),cached_activation)
+    weight_mask = group_1d_mask(40, mask)
+    modify_weights_with_1d_mask(model, weight_mask)
     # del weight_mask
     # gc.collect()
     # then mask must be loaded and unloaded manually
     generate_ids = model.generate(inputs.input_ids, max_length=30)
     print(tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0])
+
+    # revert modification
+    reload_from_cpu(model, cpu_params)
+    generate_ids = model.generate(inputs.input_ids, max_length=30)
+    print(tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0])
     
-    layer = 0
-    plot_dict={
-        f"model.layers.{layer}.self_attn.q_proj.weight":model.state_dict()[f"model.layers.{layer}.self_attn.q_proj.weight"] ,
-        f"model.layers.{layer}.self_attn.k_proj.weight":model.state_dict()[f"model.layers.{layer}.self_attn.k_proj.weight"] ,
-        f"model.layers.{layer}.self_attn.v_proj.weight":model.state_dict()[f"model.layers.{layer}.self_attn.v_proj.weight"] ,
-        f"model.layers.{layer}.self_attn.o_proj.weight":model.state_dict()[f"model.layers.{layer}.self_attn.o_proj.weight"] ,
-        f"model.layers.{layer}.mlp.gate_proj.weight":model.state_dict()[f"model.layers.{layer}.mlp.gate_proj.weight"] ,
-        f"model.layers.{layer}.mlp.up_proj.weight":model.state_dict()[f"model.layers.{layer}.mlp.up_proj.weight"] ,
-        f"model.layers.{layer}.mlp.down_proj.weight":model.state_dict()[f"model.layers.{layer}.mlp.down_proj.weight"] ,
-    }
-    plot_mask_dict={
-        f"model.layers.{layer}.self_attn.q_proj.weight":weight_mask[f"model.layers.{layer}.self_attn.q_proj.weight"] ,
-        f"model.layers.{layer}.self_attn.k_proj.weight":weight_mask[f"model.layers.{layer}.self_attn.k_proj.weight"] ,
-        f"model.layers.{layer}.self_attn.v_proj.weight":weight_mask[f"model.layers.{layer}.self_attn.v_proj.weight"] ,
-        f"model.layers.{layer}.self_attn.o_proj.weight":weight_mask[f"model.layers.{layer}.self_attn.o_proj.weight"] ,
-        f"model.layers.{layer}.mlp.gate_proj.weight":weight_mask[f"model.layers.{layer}.mlp.gate_proj.weight"] ,
-        f"model.layers.{layer}.mlp.up_proj.weight":weight_mask[f"model.layers.{layer}.mlp.up_proj.weight"] ,
-        f"model.layers.{layer}.mlp.down_proj.weight":weight_mask[f"model.layers.{layer}.mlp.down_proj.weight"] ,
-    }
     print()
+    # layer = 0
+    # plot_dict={
+    #     f"model.layers.{layer}.self_attn.q_proj.weight":model.state_dict()[f"model.layers.{layer}.self_attn.q_proj.weight"] ,
+    #     f"model.layers.{layer}.self_attn.k_proj.weight":model.state_dict()[f"model.layers.{layer}.self_attn.k_proj.weight"] ,
+    #     f"model.layers.{layer}.self_attn.v_proj.weight":model.state_dict()[f"model.layers.{layer}.self_attn.v_proj.weight"] ,
+    #     f"model.layers.{layer}.self_attn.o_proj.weight":model.state_dict()[f"model.layers.{layer}.self_attn.o_proj.weight"] ,
+    #     f"model.layers.{layer}.mlp.gate_proj.weight":model.state_dict()[f"model.layers.{layer}.mlp.gate_proj.weight"] ,
+    #     f"model.layers.{layer}.mlp.up_proj.weight":model.state_dict()[f"model.layers.{layer}.mlp.up_proj.weight"] ,
+    #     f"model.layers.{layer}.mlp.down_proj.weight":model.state_dict()[f"model.layers.{layer}.mlp.down_proj.weight"] ,
+    # }
+    # plot_mask_dict={
+    #     f"model.layers.{layer}.self_attn.q_proj.weight":weight_mask[f"model.layers.{layer}.self_attn.q_proj.weight"] ,
+    #     f"model.layers.{layer}.self_attn.k_proj.weight":weight_mask[f"model.layers.{layer}.self_attn.k_proj.weight"] ,
+    #     f"model.layers.{layer}.self_attn.v_proj.weight":weight_mask[f"model.layers.{layer}.self_attn.v_proj.weight"] ,
+    #     f"model.layers.{layer}.self_attn.o_proj.weight":weight_mask[f"model.layers.{layer}.self_attn.o_proj.weight"] ,
+    #     f"model.layers.{layer}.mlp.gate_proj.weight":weight_mask[f"model.layers.{layer}.mlp.gate_proj.weight"] ,
+    #     f"model.layers.{layer}.mlp.up_proj.weight":weight_mask[f"model.layers.{layer}.mlp.up_proj.weight"] ,
+    #     f"model.layers.{layer}.mlp.down_proj.weight":weight_mask[f"model.layers.{layer}.mlp.down_proj.weight"] ,
+    # }
+    # print()
+
+    # # to determine the activation contribution
+    # # then rescale to 0 to 1 range
+    # cached_activation_scaled = optree.tree_map(
+    #     lambda x: minmax_scale(x.view(2048, -1).to(dtype=torch.float32).sum(axis=0)),
+    #     cached_activation,
+    # )
+    # # sort the tensor descending so lower activation value can be culled / removed
+    # cached_activation_sorted = optree.tree_map(
+    #     lambda x: x.sort(axis=0, descending=True).values, cached_activation_scaled
+    # )
     # sigma_data = {
     #     "down_proj_input": [
     #         cached_activation_sorted[f"layer_{x}.down_proj_input"].numpy()
