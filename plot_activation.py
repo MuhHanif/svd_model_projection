@@ -13,6 +13,7 @@ from safetensors.torch import save_file
 import gc
 import json
 
+
 def save_to_json(data, file_path):
     """
     Save a dictionary to a JSON file.
@@ -31,6 +32,7 @@ def save_to_json(data, file_path):
     except Exception as e:
         print(f"An error occurred while saving to JSON: {str(e)}")
         return False
+
 
 def load_from_json(file_path):
     """
@@ -52,6 +54,7 @@ def load_from_json(file_path):
     except Exception as e:
         print(f"An error occurred while loading from JSON: {str(e)}")
         return {}
+
 
 def load_all_tensors(path: str):
     tensors = {}
@@ -114,8 +117,8 @@ def graph_weight(dict_of_tensors: list, name: str = None) -> None:
         plt.savefig(f"{name}.png")
     plt.close()
 
-def graph_weight_2d(dict_of_tensors: list, name: str = None) -> None:
 
+def graph_weight_2d(dict_of_tensors: list, name: str = None) -> None:
     cmap = mcolors.LinearSegmentedColormap.from_list(
         "custom_cmap",
         [
@@ -150,6 +153,7 @@ def graph_weight_2d(dict_of_tensors: list, name: str = None) -> None:
     else:
         plt.savefig(f"{name}.png")
     plt.close()
+
 
 def cum_sum_percentage(S, percentage_target):
     # Convert S to a NumPy array
@@ -262,6 +266,7 @@ def stacked_plot(
     plt.savefig(f"{name}.png")
     plt.close()
 
+
 def replace_values_below_threshold(tensor, threshold, replacement_value):
     # Create a boolean mask where values are lower than the threshold
     mask = tensor < threshold
@@ -271,6 +276,7 @@ def replace_values_below_threshold(tensor, threshold, replacement_value):
 
     return tensor
 
+
 def replace_values_above_threshold(tensor, threshold, replacement_value):
     # Create a boolean mask where values are lower than the threshold
     mask = tensor > threshold
@@ -279,6 +285,7 @@ def replace_values_above_threshold(tensor, threshold, replacement_value):
     tensor[mask] = replacement_value
 
     return tensor
+
 
 def create_activation_mask(xs, max_mag_decay_ratio=None, percentage=None):
     def _min_max_scale(xs):
@@ -300,7 +307,6 @@ def create_activation_mask(xs, max_mag_decay_ratio=None, percentage=None):
 
         return index
 
-
     def _index_sv_ratio(S, target):
         # Initialize max_sv with the value of the first element of S
         max_sv = S.max()
@@ -316,19 +322,24 @@ def create_activation_mask(xs, max_mag_decay_ratio=None, percentage=None):
 
         return index
 
-    # collapse the channel dimension by summing it 
+    # collapse the channel dimension by summing it
     # to determine the activation contribution
     # then rescale to 0 to 1 range
-    sum_and_scale = _min_max_scale(xs.view(2048, -1).to(dtype=torch.float32).sum(axis=0))
+    sum_and_scale = _min_max_scale(
+        xs.view(2048, -1).to(dtype=torch.float32).sum(axis=0)
+    )
 
     # sort the tensor descending so lower activation value can be culled / removed
     sort_act_importance = sum_and_scale.sort(axis=0, descending=True).values
 
-
     if percentage:
-        threshold = sort_act_importance[cum_sum_percentage(sort_act_importance, percentage)]
+        threshold = sort_act_importance[
+            cum_sum_percentage(sort_act_importance, percentage)
+        ]
     elif max_mag_decay_ratio:
-        threshold = sort_act_importance[_index_sv_ratio(sort_act_importance, max_mag_decay_ratio)]
+        threshold = sort_act_importance[
+            _index_sv_ratio(sort_act_importance, max_mag_decay_ratio)
+        ]
     elif max_mag_decay_ratio and percentage:
         raise "cannot use both thresholding at the same time!"
     else:
@@ -340,7 +351,6 @@ def create_activation_mask(xs, max_mag_decay_ratio=None, percentage=None):
     # Replace values below threshold with zeros and the rest with 1
     sum_and_scale[sum_and_scale < threshold] = 0
     sum_and_scale[sum_and_scale > 0] = 1
-
 
     # def _prune(tensor, sorted_tensor, max_mag_decay_ratio=None, percentage=None):
     #     if percentage:
@@ -363,71 +373,103 @@ def create_activation_mask(xs, max_mag_decay_ratio=None, percentage=None):
 
     # return _prune(sum_and_scale, sort_act_importance, max_mag_decay_ratio)
     return sum_and_scale
-    
-def modify_weights(model, mask:dict):
 
-    # TODO: 
+
+def modify_weights(model, mask: dict):
+    # TODO:
     # rebuild mask in here
     # do svd on salient weights and non salient weights separately
     # then recombine it after truncation by preserving the salient but sacrifice the non salient one
     # put the low rank mask in here!
-   
+
     # Modify the weight parameter
     for name, param in model.named_parameters():
-
         for layer_name, mask_tensor in mask.items():
             print()
             if name == layer_name:
-
                 gpu_mask = mask_tensor.to(param.data.device)
                 param.data *= gpu_mask
                 del gpu_mask
                 gc.collect()
-                break # break the inner loop
-            
-def create_mask(layer_count:int, mask_1d:dict):
+                break  # break the inner loop
 
+
+def create_mask(layer_count: int, mask_1d: dict):
     x = layer_count
     mask_dict = {}
     for x in range(layer_count):
-        
-        mask_dict[f"model.layers.{x}.self_attn.q_proj.weight"] = torch.outer(mask_1d[f"layer_{x}.query_output"], mask_1d[f"layer_{x}.qkv_input"])
-        mask_dict[f"model.layers.{x}.self_attn.k_proj.weight"] = torch.outer(mask_1d[f"layer_{x}.key_output"], mask_1d[f"layer_{x}.qkv_input"])
-        mask_dict[f"model.layers.{x}.self_attn.v_proj.weight"] = torch.outer(mask_1d[f"layer_{x}.value_output"], mask_1d[f"layer_{x}.qkv_input"])
-        mask_dict[f"model.layers.{x}.self_attn.o_proj.weight"] = torch.outer(mask_1d[f"layer_{x}.out_input"], mask_1d[f"layer_{x}.out_input"])
-        mask_dict[f"model.layers.{x}.mlp.gate_proj.weight"] = torch.outer(mask_1d[f"layer_{x}.gate_proj_output"], mask_1d[f"layer_{x}.mlp_gate_up_input"])
-        mask_dict[f"model.layers.{x}.mlp.up_proj.weight"] = torch.outer(mask_1d[f"layer_{x}.up_proj_output"], mask_1d[f"layer_{x}.mlp_gate_up_input"])
-        mask_dict[f"model.layers.{x}.mlp.down_proj.weight"] = torch.outer(mask_1d[f"layer_{x}.down_proj_output"], mask_1d[f"layer_{x}.down_proj_input"])
+        mask_dict[f"model.layers.{x}.self_attn.q_proj.weight"] = torch.outer(
+            mask_1d[f"layer_{x}.query_output"], mask_1d[f"layer_{x}.qkv_input"]
+        )
+        mask_dict[f"model.layers.{x}.self_attn.k_proj.weight"] = torch.outer(
+            mask_1d[f"layer_{x}.key_output"], mask_1d[f"layer_{x}.qkv_input"]
+        )
+        mask_dict[f"model.layers.{x}.self_attn.v_proj.weight"] = torch.outer(
+            mask_1d[f"layer_{x}.value_output"], mask_1d[f"layer_{x}.qkv_input"]
+        )
+        mask_dict[f"model.layers.{x}.self_attn.o_proj.weight"] = torch.outer(
+            mask_1d[f"layer_{x}.out_input"], mask_1d[f"layer_{x}.out_input"]
+        )
+        mask_dict[f"model.layers.{x}.mlp.gate_proj.weight"] = torch.outer(
+            mask_1d[f"layer_{x}.gate_proj_output"],
+            mask_1d[f"layer_{x}.mlp_gate_up_input"],
+        )
+        mask_dict[f"model.layers.{x}.mlp.up_proj.weight"] = torch.outer(
+            mask_1d[f"layer_{x}.up_proj_output"],
+            mask_1d[f"layer_{x}.mlp_gate_up_input"],
+        )
+        mask_dict[f"model.layers.{x}.mlp.down_proj.weight"] = torch.outer(
+            mask_1d[f"layer_{x}.down_proj_output"],
+            mask_1d[f"layer_{x}.down_proj_input"],
+        )
     return mask_dict
 
-def group_1d_mask(layer_count:int, mask_1d:dict):
 
+def group_1d_mask(layer_count: int, mask_1d: dict):
     x = layer_count
     mask_dict = {}
     for x in range(layer_count):
-        
-        mask_dict[f"model.layers.{x}.self_attn.q_proj.weight"] = (mask_1d[f"layer_{x}.query_output"], mask_1d[f"layer_{x}.qkv_input"])
-        mask_dict[f"model.layers.{x}.self_attn.k_proj.weight"] = (mask_1d[f"layer_{x}.key_output"], mask_1d[f"layer_{x}.qkv_input"])
-        mask_dict[f"model.layers.{x}.self_attn.v_proj.weight"] = (mask_1d[f"layer_{x}.value_output"], mask_1d[f"layer_{x}.qkv_input"])
-        mask_dict[f"model.layers.{x}.self_attn.o_proj.weight"] = (mask_1d[f"layer_{x}.out_input"], mask_1d[f"layer_{x}.out_input"])
-        mask_dict[f"model.layers.{x}.mlp.gate_proj.weight"] = (mask_1d[f"layer_{x}.gate_proj_output"], mask_1d[f"layer_{x}.mlp_gate_up_input"])
-        mask_dict[f"model.layers.{x}.mlp.up_proj.weight"] = (mask_1d[f"layer_{x}.up_proj_output"], mask_1d[f"layer_{x}.mlp_gate_up_input"])
-        mask_dict[f"model.layers.{x}.mlp.down_proj.weight"] = (mask_1d[f"layer_{x}.down_proj_output"], mask_1d[f"layer_{x}.down_proj_input"])
+        mask_dict[f"model.layers.{x}.self_attn.q_proj.weight"] = (
+            mask_1d[f"layer_{x}.query_output"],
+            mask_1d[f"layer_{x}.qkv_input"],
+        )
+        mask_dict[f"model.layers.{x}.self_attn.k_proj.weight"] = (
+            mask_1d[f"layer_{x}.key_output"],
+            mask_1d[f"layer_{x}.qkv_input"],
+        )
+        mask_dict[f"model.layers.{x}.self_attn.v_proj.weight"] = (
+            mask_1d[f"layer_{x}.value_output"],
+            mask_1d[f"layer_{x}.qkv_input"],
+        )
+        mask_dict[f"model.layers.{x}.self_attn.o_proj.weight"] = (
+            mask_1d[f"layer_{x}.out_input"],
+            mask_1d[f"layer_{x}.out_input"],
+        )
+        mask_dict[f"model.layers.{x}.mlp.gate_proj.weight"] = (
+            mask_1d[f"layer_{x}.gate_proj_output"],
+            mask_1d[f"layer_{x}.mlp_gate_up_input"],
+        )
+        mask_dict[f"model.layers.{x}.mlp.up_proj.weight"] = (
+            mask_1d[f"layer_{x}.up_proj_output"],
+            mask_1d[f"layer_{x}.mlp_gate_up_input"],
+        )
+        mask_dict[f"model.layers.{x}.mlp.down_proj.weight"] = (
+            mask_1d[f"layer_{x}.down_proj_output"],
+            mask_1d[f"layer_{x}.down_proj_input"],
+        )
     return mask_dict
 
-def modify_weights_with_1d_mask(model, mask:dict):
 
-    # TODO: 
+def modify_weights_with_1d_mask(model, mask: dict):
+    # TODO:
     # rebuild mask in here
     # do svd on salient weights and non salient weights separately
     # then recombine it after truncation by preserving the salient but sacrifice the non salient one
     # put the low rank mask in here!
-   
+
     # Modify the weight parameter
     for name, param in model.named_parameters():
-
         for layer_name, mask_tensor in mask.items():
-
             if name == layer_name:
                 # rebuild mask
                 mask_tensor_2d = torch.outer(mask_tensor[0], mask_tensor[1])
@@ -435,34 +477,29 @@ def modify_weights_with_1d_mask(model, mask:dict):
                 param.data *= gpu_mask
                 del gpu_mask, mask_tensor_2d
                 gc.collect()
-                break # break the inner loop
+                break  # break the inner loop
 
 
-def reload_from_cpu(model, model_state_dict_cpu:dict):
-   
+def reload_from_cpu(model, model_state_dict_cpu: dict):
     # Modify the weight parameter
     for in_gpu_layer_name, in_gpu_tensor in model.named_parameters():
-        
         for in_cpu_layer_name, in_cpu_tensor in model_state_dict_cpu.items():
-
             if in_gpu_layer_name == in_cpu_layer_name:
-
                 in_gpu_tensor.data = in_cpu_tensor.to(device=in_gpu_tensor.data.device)
                 gc.collect()
-                break # break the inner loop
+                break  # break the inner loop
+
 
 def store_state_dict(model):
-
     cpu_params = {}
     # Modify the weight parameter
     for in_gpu_layer_name, in_gpu_tensor in model.named_parameters():
         cpu_params[in_gpu_layer_name] = in_gpu_tensor.to(device="cpu")
-    
+
     return cpu_params
 
 
-def load_cached_activation(safetensors_path:str):
-
+def load_cached_activation(safetensors_path: str):
     cached_activation = load_all_tensors(safetensors_path)
     # there's inf value so i flip it to neg inf
     cached_activation = optree.tree_map(
@@ -486,11 +523,9 @@ def load_cached_activation(safetensors_path:str):
         )
     return cached_activation
 
+
 def main():
     cached_activation = load_cached_activation("activation.safetensors")
-
-
-    
 
     model_dir = "/home/zadmin/llama_stuff/CodeLlama-13b-Instruct-hf"
     tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path=model_dir)
@@ -505,30 +540,43 @@ def main():
 
     cpu_params = store_state_dict(model)
 
-
     prompt = "[INST] hello, can you explain what dark matter is?[/INST]"
     inputs = tokenizer(prompt, return_tensors="pt")
 
     # Generate
     generate_ids = model.generate(inputs.input_ids, max_length=30)
-    print(tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0])
+    print(
+        tokenizer.batch_decode(
+            generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0]
+    )
 
     # weight mask by activation
-    # collapse the channel dimension by summing it 
-    mask = optree.tree_map(lambda x: create_activation_mask(x, percentage=0.95),cached_activation)
+    # collapse the channel dimension by summing it
+    mask = optree.tree_map(
+        lambda x: create_activation_mask(x, percentage=0.95), cached_activation
+    )
     weight_mask = group_1d_mask(40, mask)
     modify_weights_with_1d_mask(model, weight_mask)
     # del weight_mask
     # gc.collect()
     # then mask must be loaded and unloaded manually
     generate_ids = model.generate(inputs.input_ids, max_length=30)
-    print(tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0])
+    print(
+        tokenizer.batch_decode(
+            generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0]
+    )
 
     # revert modification
     reload_from_cpu(model, cpu_params)
     generate_ids = model.generate(inputs.input_ids, max_length=30)
-    print(tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0])
-    
+    print(
+        tokenizer.batch_decode(
+            generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0]
+    )
+
     print()
     # layer = 0
     # plot_dict={
